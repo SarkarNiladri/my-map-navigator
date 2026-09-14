@@ -66,6 +66,11 @@ html, body {
     color: white;
 }
 
+.action-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
 #map {
     width: 100%;
     height: calc(100vh - 60px);
@@ -84,6 +89,21 @@ html, body {
     max-width: 360px;
 }
 
+#loadingSpinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid #1976d2;
+    border-top: 2px solid transparent;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin-right: 6px;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
 #locateBtn {
     position: absolute;
     right: 14px;
@@ -97,6 +117,10 @@ html, body {
     font-weight: bold;
     cursor: pointer;
     box-shadow: 0 3px 12px rgba(0,0,0,.30);
+}
+
+#locateBtn:hover {
+    background: #1565c0;
 }
 
 #resultsPanel {
@@ -154,6 +178,10 @@ html, body {
     color: #fff;
 }
 
+.navigate-btn:hover {
+    background: #1565c0;
+}
+
 .clear-route-btn {
     margin-left: 6px;
     background: #eee;
@@ -198,57 +226,6 @@ html, body {
     box-shadow: 0 2px 10px rgba(0,0,0,.2);
     font-size: 12px;
     display: none;
-}
-
-#navArrow {
-    position: absolute;
-    z-index: 25;
-    left: 50%;
-    top: 50%;
-    width: 58px;
-    height: 58px;
-    margin-left: -29px;
-    margin-top: -29px;
-    display: none;
-    align-items: center;
-    justify-content: center;
-    pointer-events: none;
-    filter: drop-shadow(0 2px 6px rgba(0,0,0,.35));
-}
-
-#navArrow .arrow {
-    width: 0;
-    height: 0;
-    border-left: 15px solid transparent;
-    border-right: 15px solid transparent;
-    border-bottom: 34px solid #1976d2;
-    position: relative;
-    transform-origin: 50% 80%;
-}
-
-#navArrow .arrow::after {
-    content: "";
-    position: absolute;
-    left: -5px;
-    top: 19px;
-    width: 10px;
-    height: 16px;
-    background: #1976d2;
-    border-radius: 2px;
-}
-
-#navigationInfo {
-    position: absolute;
-    top: 125px;
-    left: 12px;
-    z-index: 20;
-    display: none;
-    background: rgba(255,255,255,.96);
-    border-radius: 11px;
-    box-shadow: 0 2px 12px rgba(0,0,0,.24);
-    padding: 10px 13px;
-    min-width: 190px;
-    font-size: 12px;
 }
 
 #satelliteAttribution {
@@ -323,12 +300,6 @@ html, body {
 
 <div id="map"></div>
 
-<div id="navArrow">
-    <div class="arrow"></div>
-</div>
-
-<div id="navigationInfo"></div>
-
 <div id="accuracyBadge">
     GPS: waiting...
 </div>
@@ -343,15 +314,15 @@ html, body {
 <button id="locateBtn">📍 Locate Me</button>
 
 <div id="satelliteAttribution">
-    Satellite imagery © Esri and its data providers
+    Satellite imagery © Esri 2024
 </div>
 
 <script src="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.js"></script>
 
 <script>
 const OVERPASS_SERVERS = [
-    "https://overpass.private.coffee/api/interpreter",
-    "https://overpass-api.de/api/interpreter"
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter"
 ];
 
 const OSRM_URL = "https://router.project-osrm.org";
@@ -365,22 +336,22 @@ let placeMarkers = [];
 let routePopup = null;
 let isSatellite = false;
 let lastLocationUpdate = 0;
-
-let navigationActive = false;
-let navigationDestination = null;
-let navigationRoute = null;
-let lastRouteUpdateAt = 0;
-let lastHeading = null;
-let lastGoodLat = null;
-let lastGoodLon = null;
-let deviceHeading = null;
-let headingPermissionRequested = false;
+let lastStablePosition = null;
+let positionUpdateTimeout = null;
 
 const statusEl = document.getElementById("status");
 const accuracyBadge = document.getElementById("accuracyBadge");
 const resultsPanel = document.getElementById("resultsPanel");
 const resultsEl = document.getElementById("results");
 const radiusSelect = document.getElementById("radiusSelect");
+
+// GPS stabilization parameters
+const GPS_STABILIZATION = {
+    POSITION_THRESHOLD: 5, // meters - minimum movement to update
+    ACCURACY_THRESHOLD: 2, // meters - improvement needed
+    UPDATE_DELAY: 1000,    // milliseconds - debounce delay
+    MAX_ACCURACY: 50       // meters - max acceptable accuracy
+};
 
 map = new maplibregl.Map({
     container: "map",
@@ -431,1391 +402,433 @@ function distanceMeters(lat1, lon1, lat2, lon2) {
     );
 }
 
-/*
- * The browser/device determines actual GPS accuracy.
- * We cannot manufacture better GPS accuracy in JavaScript.
- *
- * This version improves practical accuracy by:
- * 1. enableHighAccuracy=true
- * 2. watchPosition() for continuous updates
- * 3. maximumAge=0 to avoid cached readings
- * 4. rejecting very old updates
- * 5. keeping the best accuracy reading
- * 6. ignoring obviously worse jumps when a good fix exists
- */
-function startHighAccuracyTracking() {
+function shouldUpdatePosition(newPos, newAccuracy) {
+    if (!lastStablePosition) return true;
+    
+    const distance = distanceMeters(
+        lastStablePosition.latitude,
+        lastStablePosition.longitude,
+        newPos.latitude,
+        newPos.longitude
+    );
+    
+    const accuracyImproved = 
+        newAccuracy < bestAccuracy - GPS_STABILIZATION.ACCURACY_THRESHOLD;
+    
+    return distance > GPS_STABILIZATION.POSITION_THRESHOLD || accuracyImproved;
+}
 
-    if (!navigator.geolocation) {
-        statusEl.innerHTML =
-            "❌ This browser does not support location.";
+function updateUserPosition(position) {
+    const newPos = {
+        latitude: position.coords.latitude,
+        longitude: position.coords.longitude
+    };
+    
+    const newAccuracy = position.coords.accuracy;
+
+    // Debounce and stabilize position updates
+    clearTimeout(positionUpdateTimeout);
+    
+    if (!shouldUpdatePosition(newPos, newAccuracy)) {
         return;
     }
 
-    if (watchId !== null) {
-        navigator.geolocation.clearWatch(watchId);
+    positionUpdateTimeout = setTimeout(() => {
+        currentPosition = newPos;
+        lastStablePosition = newPos;
+        bestAccuracy = Math.min(bestAccuracy, newAccuracy);
+        lastLocationUpdate = Date.now();
+
+        // Update accuracy badge
+        const accText = 
+            newAccuracy < 10 ? "🟢 High" :
+            newAccuracy < 20 ? "🟡 Good" : "🔴 Fair";
+        
+        accuracyBadge.innerHTML = 
+            `GPS: ${accText} (${Math.round(newAccuracy)}m)`;
+        accuracyBadge.style.display = "block";
+
+        // Update user marker position (smooth animation)
+        if (!userMarker) {
+            userMarker = new maplibregl.Marker(
+                { element: createUserMarkerElement() }
+            ).setLngLat([newPos.longitude, newPos.latitude])
+             .addTo(map);
+        } else {
+            userMarker.setLngLat([newPos.longitude, newPos.latitude]);
+        }
+
+        statusEl.innerHTML = `📍 Location: ${newPos.latitude.toFixed(4)}, ${newPos.longitude.toFixed(4)}`;
+    }, GPS_STABILIZATION.UPDATE_DELAY);
+}
+
+function createUserMarkerElement() {
+    const el = document.createElement("div");
+    el.className = "user-marker";
+    return el;
+}
+
+function handleLocationError(error) {
+    console.error("GPS Error:", error);
+    
+    let msg = "📍 GPS unavailable.";
+    if (error.code === error.PERMISSION_DENIED) {
+        msg = "❌ Location permission denied.";
+    } else if (error.code === error.TIMEOUT) {
+        msg = "⏱️ GPS signal timed out.";
+    }
+    
+    statusEl.innerHTML = msg;
+}
+
+function startHighAccuracyTracking() {
+    if (!navigator.geolocation) {
+        statusEl.innerHTML = "❌ Geolocation not supported.";
+        return;
     }
 
-    statusEl.innerHTML =
-        "📡 Searching for the best GPS position...";
+    statusEl.innerHTML = "📍 Acquiring GPS location (high accuracy)...";
+    accuracyBadge.innerHTML = "GPS: 🔴 Waiting...";
 
     watchId = navigator.geolocation.watchPosition(
-        handleLocationUpdate,
+        updateUserPosition,
         handleLocationError,
         {
             enableHighAccuracy: true,
-            timeout: 30000,
+            timeout: 10000,
             maximumAge: 0
         }
     );
 }
 
-function handleLocationUpdate(position) {
-
-    const coords = position.coords;
-
-    const latitude = coords.latitude;
-    const longitude = coords.longitude;
-    const accuracy = coords.accuracy;
-
-    if (!Number.isFinite(latitude) ||
-        !Number.isFinite(longitude) ||
-        !Number.isFinite(accuracy)) {
-        return;
-    }
-
-    const now = Date.now();
-
-    /*
-     * Avoid excessive UI/map updates.
-     * But always accept a significantly better accuracy reading.
-     */
-    const significantlyBetter =
-        accuracy < bestAccuracy * 0.80;
-
-    const enoughTimePassed =
-        now - lastLocationUpdate > 1200;
-
-    if (!significantlyBetter && !enoughTimePassed) {
-        return;
-    }
-
-    /*
-     * Ignore an isolated very poor reading once
-     * we already have a reasonably good position.
-     */
-    if (bestAccuracy < 50 && accuracy > bestAccuracy * 4) {
-        return;
-    }
-
-    lastLocationUpdate = now;
-
-    if (accuracy < bestAccuracy) {
-        bestAccuracy = accuracy;
-    }
-
-    /*
-     * Reject an occasional large GPS jump when we already have
-     * a much better fix and the new measurement is very inaccurate.
-     */
-    if (
-        currentPosition &&
-        accuracy > 100 &&
-        distanceMeters(
-            currentPosition.latitude,
-            currentPosition.longitude,
-            latitude,
-            longitude
-        ) > Math.max(accuracy * 1.5, 150)
-    ) {
-        return;
-    }
-
-    currentPosition = {
-        latitude,
-        longitude,
-        accuracy,
-        altitude: coords.altitude,
-        heading: coords.heading,
-        speed: coords.speed,
-        timestamp: position.timestamp
-    };
-
-    updateUserMarker(
-        latitude,
-        longitude,
-        accuracy
-    );
-
-    updateAccuracyCircle(
-        longitude,
-        latitude,
-        accuracy
-    );
-
-    updateAccuracyUI(accuracy);
-
-    if (navigationActive) {
-        updateArrowFromMovement(
-            latitude,
-            longitude
-        );
-
-        if (shouldRecalculateRoute(
-            latitude,
-            longitude
-        )) {
-            recalculateActiveRoute();
-        }
-    }
-
-    // Only center/zoom on the initial fix. Later GPS updates should
-    // move the marker without unexpectedly changing the user's map zoom.
-    if (!userMarker) {
-        map.flyTo({
-            center: [longitude, latitude],
-            zoom: 17,
-            speed: 1.1,
-            curve: 1.2
-        });
-    }
-
-    if (accuracy <= 10) {
-        statusEl.innerHTML =
-            `🎯 Excellent GPS fix<br>
-             Accuracy: <b>±${Math.round(accuracy)} m</b>`;
-    }
-    else if (accuracy <= 25) {
-        statusEl.innerHTML =
-            `📍 Very good GPS fix<br>
-             Accuracy: <b>±${Math.round(accuracy)} m</b>`;
-    }
-    else if (accuracy <= 50) {
-        statusEl.innerHTML =
-            `📍 Good GPS fix<br>
-             Accuracy: <b>±${Math.round(accuracy)} m</b>`;
-    }
-    else {
-        statusEl.innerHTML =
-            `📡 Improving GPS position...<br>
-             Current accuracy: <b>±${Math.round(accuracy)} m</b><br>
-             Best this session: <b>±${Math.round(bestAccuracy)} m</b>`;
-    }
-}
-
-function bearingBetween(lat1, lon1, lat2, lon2) {
-    const p1 = lat1 * Math.PI / 180;
-    const p2 = lat2 * Math.PI / 180;
-    const dl = (lon2 - lon1) * Math.PI / 180;
-
-    const y = Math.sin(dl) * Math.cos(p2);
-    const x =
-        Math.cos(p1) * Math.sin(p2) -
-        Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
-
-    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
-}
-
-function normalizeAngleDelta(delta) {
-    while (delta > 180) delta -= 360;
-    while (delta < -180) delta += 360;
-    return delta;
-}
-
-function smoothHeading(previous, next) {
-    if (previous === null || previous === undefined) return next;
-
-    const delta = normalizeAngleDelta(next - previous);
-    return (previous + delta * 0.25 + 360) % 360;
-}
-
-function setArrowHeading(degrees) {
-    if (!Number.isFinite(degrees)) return;
-
-    lastHeading = smoothHeading(lastHeading, degrees);
-
-    const arrow =
-        document.querySelector("#navArrow .arrow");
-
-    if (arrow) {
-        arrow.style.transform =
-            `rotate(${lastHeading}deg)`;
-    }
-}
-
-function updateNavigationInfo(distanceMetersValue, etaMinutes, headingText = "") {
-    const box = document.getElementById("navigationInfo");
-
-    if (!navigationActive) {
-        box.style.display = "none";
-        return;
-    }
-
-    box.style.display = "block";
-
-    box.innerHTML = `
-        <div><b>🧭 Navigation active</b></div>
-        <div>Remaining: <b>${formatDistance(distanceMetersValue)}</b></div>
-        <div>ETA: <b>${etaMinutes} min</b></div>
-        ${headingText ? `<div>Direction: <b>${headingText}</b></div>` : ""}
-    `;
-}
-
-function startHeadingTracking() {
-    if (headingPermissionRequested) return;
-    headingPermissionRequested = true;
-
-    /*
-     * iOS requires explicit permission for motion/orientation data.
-     * Other browsers generally do not.
-     */
-    if (
-        typeof DeviceOrientationEvent !== "undefined" &&
-        typeof DeviceOrientationEvent.requestPermission === "function"
-    ) {
-        DeviceOrientationEvent.requestPermission()
-            .then(state => {
-                if (state === "granted") {
-                    window.addEventListener(
-                        "deviceorientationabsolute",
-                        handleDeviceOrientation,
-                        true
-                    );
-                }
-            })
-            .catch(() => {});
-    } else if ("DeviceOrientationEvent" in window) {
-        window.addEventListener(
-            "deviceorientationabsolute",
-            handleDeviceOrientation,
-            true
-        );
-        window.addEventListener(
-            "deviceorientation",
-            handleDeviceOrientation,
-            true
-        );
-    }
-}
-
-function handleDeviceOrientation(event) {
-    if (!navigationActive) return;
-
-    let heading = null;
-
-    if (typeof event.webkitCompassHeading === "number") {
-        heading = event.webkitCompassHeading;
-    } else if (typeof event.alpha === "number") {
-        heading = (360 - event.alpha) % 360;
-    }
-
-    if (heading !== null && Number.isFinite(heading)) {
-        deviceHeading = heading;
-        setArrowHeading(heading);
-    }
-}
-
-function getDirectionName(degrees) {
-    const names = [
-        "N", "NE", "E", "SE",
-        "S", "SW", "W", "NW"
-    ];
-    return names[
-        Math.round(degrees / 45) % 8
-    ];
-}
-
-function updateArrowFromMovement(lat, lon) {
-    if (!lastGoodLat || !lastGoodLon) {
-        lastGoodLat = lat;
-        lastGoodLon = lon;
-        return;
-    }
-
-    const moved =
-        distanceMeters(
-            lastGoodLat,
-            lastGoodLon,
-            lat,
-            lon
-        );
-
-    if (moved >= 4) {
-        const movementHeading =
-            bearingBetween(
-                lastGoodLat,
-                lastGoodLon,
-                lat,
-                lon
-            );
-
-        if (deviceHeading === null) {
-            setArrowHeading(movementHeading);
-        }
-
-        lastGoodLat = lat;
-        lastGoodLon = lon;
-    }
-}
-
-function shouldRecalculateRoute(lat, lon) {
-    if (!navigationActive || !navigationDestination) {
-        return false;
-    }
-
-    if (Date.now() - lastRouteUpdateAt < 8000) {
-        return false;
-    }
-
-    if (!navigationRoute?.geometry?.coordinates?.length) {
-        return true;
-    }
-
-    let closest = Infinity;
-
-    for (const coord of navigationRoute.geometry.coordinates) {
-        const d = distanceMeters(
-            lat,
-            lon,
-            coord[1],
-            coord[0]
-        );
-
-        if (d < closest) closest = d;
-    }
-
-    /*
-     * Recalculate if the user is roughly 40 m or more
-     * from the currently displayed route.
-     */
-    return closest > 40;
-}
-
-async function recalculateActiveRoute() {
-    if (!navigationActive || !navigationDestination || !currentPosition) {
-        return;
-    }
-
-    await drawRouteToDestination(
-        navigationDestination.lat,
-        navigationDestination.lon,
-        navigationDestination.name,
-        true
-    );
-}
-
-function updateAccuracyUI(accuracy) {
-
-    accuracyBadge.style.display = "block";
-
-    let label;
-
-    if (accuracy <= 10) {
-        label = "🎯 Excellent";
-    }
-    else if (accuracy <= 25) {
-        label = "🟢 Very good";
-    }
-    else if (accuracy <= 50) {
-        label = "🟡 Good";
-    }
-    else {
-        label = "🟠 Improving";
-    }
-
-    accuracyBadge.innerHTML =
-        `${label} GPS: <b>±${Math.round(accuracy)} m</b><br>
-         Best: <b>±${Math.round(bestAccuracy)} m</b>`;
-}
-
-function handleLocationError(error) {
-
-    switch (error.code) {
-
-        case error.PERMISSION_DENIED:
-            statusEl.innerHTML =
-                "❌ Location permission was denied.";
-            break;
-
-        case error.POSITION_UNAVAILABLE:
-            statusEl.innerHTML =
-                "❌ GPS/location information unavailable.";
-            break;
-
-        case error.TIMEOUT:
-            statusEl.innerHTML =
-                "⏱️ GPS is taking too long. Keep the device near a window or outdoors.";
-            break;
-
-        default:
-            statusEl.innerHTML =
-                "❌ Unable to determine your location.";
-    }
-}
-
-function updateUserMarker(lat, lon, accuracy) {
-
-    if (!userMarker) {
-
-        const markerElement =
-            document.createElement("div");
-
-        markerElement.className =
-            "user-marker";
-
-        userMarker =
-            new maplibregl.Marker({
-                element: markerElement
-            })
-            .setLngLat([lon, lat])
-            .setPopup(
-                new maplibregl.Popup({
-                    offset: 15
-                })
-            )
-            .addTo(map);
-
-    } else {
-
-        userMarker.setLngLat([lon, lat]);
-    }
-
-    userMarker.getPopup().setHTML(`
-        <strong>📍 Your Location</strong><br><br>
-        Latitude: ${lat.toFixed(7)}<br>
-        Longitude: ${lon.toFixed(7)}<br>
-        GPS Accuracy: ±${Math.round(accuracy)} meters
-    `);
-}
-
-function createAccuracyCircle(lng, lat, radiusMeters) {
-
-    const points = 64;
-    const earthRadius = 6371008.8;
-    const coordinates = [];
-
-    for (let i = 0; i <= points; i++) {
-
-        const angle =
-            (i / points) * 2 * Math.PI;
-
-        const latOffset =
-            (radiusMeters / earthRadius) *
-            Math.cos(angle);
-
-        const lngOffset =
-            (radiusMeters / earthRadius) *
-            Math.sin(angle) /
-            Math.cos(lat * Math.PI / 180);
-
-        coordinates.push([
-            lng + lngOffset * 180 / Math.PI,
-            lat + latOffset * 180 / Math.PI
-        ]);
-    }
-
-    return {
-        type: "Feature",
-        geometry: {
-            type: "Polygon",
-            coordinates: [coordinates]
-        }
-    };
-}
-
-function updateAccuracyCircle(lng, lat, radius) {
-
-    const geojson =
-        createAccuracyCircle(
-            lng,
-            lat,
-            radius
-        );
-
-    if (map.getSource("accuracy-source")) {
-        map.getSource("accuracy-source")
-            .setData(geojson);
-        return;
-    }
-
-    map.addSource(
-        "accuracy-source",
-        {
-            type: "geojson",
-            data: geojson
-        }
-    );
-
-    map.addLayer({
-        id: "accuracy-fill",
-        type: "fill",
-        source: "accuracy-source",
-        paint: {
-            "fill-color": "#1976d2",
-            "fill-opacity": 0.12
-        }
-    });
-
-    map.addLayer({
-        id: "accuracy-line",
-        type: "line",
-        source: "accuracy-source",
-        paint: {
-            "line-color": "#1976d2",
-            "line-width": 2,
-            "line-opacity": 0.65
-        }
-    });
-}
-
-function addSatelliteLayer() {
-
-    if (map.getSource("satellite-source")) {
-        return;
-    }
-
-    /*
-     * Esri World Imagery.
-     * Intended here for personal/non-commercial use.
-     * Keep attribution visible when satellite mode is active.
-     */
-    map.addSource("satellite-source", {
-        type: "raster",
-        tiles: [
-            "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-        ],
-        tileSize: 256,
-        attribution:
-            "Esri, Maxar, Earthstar Geographics, and the GIS User Community"
-    });
-
-    map.addLayer({
-        id: "satellite-layer",
-        type: "raster",
-        source: "satellite-source",
-        layout: {
-            visibility: "none"
-        },
-        paint: {
-            "raster-opacity": 1
-        }
-    });
-}
-
-function setMapMode(satellite) {
-
-    isSatellite = satellite;
-
-    addSatelliteLayer();
-
-    map.setLayoutProperty(
-        "satellite-layer",
-        "visibility",
-        satellite ? "visible" : "none"
-    );
-
-    document
-        .getElementById("satelliteBtn")
-        .classList.toggle("active", satellite);
-
-    document
-        .getElementById("streetBtn")
-        .classList.toggle("active", !satellite);
-
-    document.getElementById(
-        "satelliteAttribution"
-    ).style.display =
-        satellite ? "block" : "none";
-}
-
-function createPlaceMarker(place, type) {
-
-    const el =
-        document.createElement("div");
-
-    el.className = "marker-pin";
-
-    const icon =
-        type === "atm" ? "🏧" :
-        type === "bank" ? "🏦" : "🛒";
-
-    el.innerHTML =
-        `<span>${icon}</span>`;
-
-    const marker =
-        new maplibregl.Marker({
-            element: el
-        })
-        .setLngLat([
-            place.lon,
-            place.lat
-        ])
-        .addTo(map);
-
-    marker.getElement()
-        .addEventListener(
-            "click",
-            () => showPlacePopup(place, type)
-        );
-
-    placeMarkers.push(marker);
-}
-
 function clearPlaceMarkers() {
-
-    placeMarkers.forEach(
-        marker => marker.remove()
-    );
-
+    placeMarkers.forEach(marker => marker.remove());
     placeMarkers = [];
 }
 
-function showPlacePopup(place, type) {
+function createPlaceMarker(place, type) {
+    const el = document.createElement("div");
+    el.className = "marker-pin";
+    
+    const iconMap = {
+        atm: "🏧",
+        bank: "🏦",
+        shop: "🛒"
+    };
+    
+    el.innerHTML = `<span>${iconMap[type] || "📍"}</span>`;
 
-    const icon =
-        type === "atm" ? "🏧" :
-        type === "bank" ? "🏦" : "🛒";
-
-    const name =
-        place.name ||
-        (
-            type === "atm" ? "ATM" :
-            type === "bank" ? "Bank" : "Shop"
-        );
-
-    if (routePopup) {
-        routePopup.remove();
-    }
-
-    routePopup =
-        new maplibregl.Popup({
-            offset: 15
-        })
-        .setLngLat([
-            place.lon,
-            place.lat
-        ])
-        .setHTML(`
-            <strong>${icon} ${escapeHtml(name)}</strong><br>
-            ${place.distanceText} away<br><br>
-            <button
-                class="navigate-btn"
-                onclick="navigateToPlace(
-                    ${place.lat},
-                    ${place.lon},
-                    '${escapeHtml(name).replaceAll("'", "\\'")}'
-                )">
-                🧭 Navigate
-            </button>
-        `)
+    const marker = new maplibregl.Marker({ element: el })
+        .setLngLat([place.lon, place.lat])
         .addTo(map);
+
+    const popupContent = `
+        <strong>${escapeHtml(place.name)}</strong><br>
+        📏 ${place.distanceText} away<br>
+        ${place.tags["addr:street"] ? `📍 ${escapeHtml(place.tags["addr:street"])}<br>` : ""}
+    `;
+
+    const popup = new maplibregl.Popup({ offset: 25 })
+        .setHTML(popupContent);
+
+    marker.setPopup(popup);
+    placeMarkers.push(marker);
 }
 
-function zoomToUser() {
-    if (!currentPosition) return;
-
-    map.stop();
-
-    map.flyTo({
-        center: [
-            currentPosition.longitude,
-            currentPosition.latitude
-        ],
-        zoom: 18,
-        speed: 1.1,
-        curve: 1.2
+function setMapMode(satellite) {
+    isSatellite = satellite;
+    
+    document.querySelectorAll("#streetBtn, #satelliteBtn").forEach(btn => {
+        btn.classList.remove("active");
     });
-}
 
-function clearRoute() {
+    if (satellite) {
+        document.getElementById("satelliteBtn").classList.add("active");
+        
+        // Use Esri World Imagery (fresh satellite imagery)
+        const esriUrl = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}";
+        const attribution = '© Esri 2024';
+        
+        // Check if satellite layer exists
+        if (!map.getSource("esri-satellite")) {
+            map.addSource("esri-satellite", {
+                type: "raster",
+                url: `pmtiles://${esriUrl}`,
+                tiles: [esriUrl],
+                tileSize: 256,
+                attribution: attribution
+            });
 
-    if (map.getLayer("route-line")) {
-        map.removeLayer("route-line");
-    }
-
-    if (map.getSource("route-source")) {
-        map.removeSource("route-source");
-    }
-
-    if (routePopup) {
-        routePopup.remove();
-        routePopup = null;
-    }
-}
-
-async function drawRouteToDestination(lat, lon, name, isRecalculation = false) {
-
-    if (!currentPosition) {
-        alert("Please allow your location first.");
-        return;
-    }
-
-    const startLon =
-        currentPosition.longitude;
-
-    const startLat =
-        currentPosition.latitude;
-
-    const url =
-        `${OSRM_URL}/route/v1/driving/` +
-        `${startLon},${startLat};${lon},${lat}` +
-        `?overview=full&geometries=geojson&steps=true`;
-
-    try {
-
-        if (!isRecalculation) {
-            clearRoute();
-        }
-
-        statusEl.innerHTML =
-            `🧭 ${isRecalculation ? "Updating" : "Calculating"} route to <b>${escapeHtml(name)}</b>...`;
-
-        const response =
-            await fetch(url, { cache: "no-store" });
-
-        if (!response.ok) {
-            throw new Error(
-                "Routing service error."
-            );
-        }
-
-        const data =
-            await response.json();
-
-        if (
-            data.code !== "Ok" ||
-            !data.routes?.length
-        ) {
-            throw new Error(
-                "No route found."
-            );
-        }
-
-        const route =
-            data.routes[0];
-
-        navigationRoute = route;
-        lastRouteUpdateAt = Date.now();
-
-        navigationDestination = {
-            lat,
-            lon,
-            name
-        };
-
-        if (map.getLayer("route-line")) {
-            map.removeLayer("route-line");
-        }
-
-        if (map.getSource("route-source")) {
-            map.removeSource("route-source");
-        }
-
-        map.addSource(
-            "route-source",
-            {
-                type: "geojson",
-                data: {
-                    type: "Feature",
-                    properties: {},
-                    geometry: route.geometry
+            // Remove street layer
+            if (map.getLayer("liberty-background")) {
+                const layers = map.getStyle().layers;
+                const baseLayer = layers.find(l => l.type === "background" || l.id.includes("background"));
+                if (baseLayer) {
+                    map.removeLayer(baseLayer.id);
                 }
             }
-        );
 
-        map.addLayer({
-            id: "route-line",
-            type: "line",
-            source: "route-source",
-            layout: {
-                "line-join": "round",
-                "line-cap": "round"
-            },
-            paint: {
-                "line-color": "#1976d2",
-                "line-width": 6,
-                "line-opacity": 0.88
+            // Add satellite layer
+            map.addLayer({
+                id: "esri-satellite-layer",
+                type: "raster",
+                source: "esri-satellite",
+                minzoom: 0,
+                maxzoom: 19
+            }, "liberty-halo");
+        } else {
+            const layer = map.getLayer("esri-satellite-layer");
+            if (layer) {
+                map.setLayoutProperty("esri-satellite-layer", "visibility", "visible");
             }
-        });
-
-        const distance =
-            formatDistance(route.distance);
-
-        const minutes =
-            Math.max(
-                1,
-                Math.round(
-                    route.duration / 60
-                )
-            );
-
-        /*
-         * Navigation view: keep the current position near the
-         * lower-middle portion of the screen instead of zooming out.
-         */
-        map.easeTo({
-            center: [
-                currentPosition.longitude,
-                currentPosition.latitude
-            ],
-            zoom: 18,
-            duration: 700
-        });
-
-        updateNavigationInfo(
-            route.distance,
-            minutes,
-            lastHeading !== null
-                ? getDirectionName(lastHeading)
-                : ""
-        );
-
-        statusEl.innerHTML = `
-            🧭 <b>${escapeHtml(name)}</b><br>
-            Distance: <b>${distance}</b><br>
-            ETA: <b>${minutes} min</b>
-        `;
-
-        document.getElementById("navArrow").style.display =
-            "flex";
-
-        startHeadingTracking();
-
-    } catch (error) {
-
-        console.error(error);
-
-        statusEl.innerHTML =
-            "❌ Could not calculate the route.";
-
-        if (!isRecalculation) {
-            navigationActive = false;
-            navigationDestination = null;
-            navigationRoute = null;
-            document.getElementById("navArrow").style.display =
-                "none";
-            updateNavigationInfo(0, 0);
         }
+
+        document.getElementById("satelliteAttribution").style.display = "block";
+        statusEl.innerHTML = "🛰️ Switched to satellite view";
+    } else {
+        document.getElementById("streetBtn").classList.add("active");
+        
+        // Switch back to street view
+        const layer = map.getLayer("esri-satellite-layer");
+        if (layer) {
+            map.setLayoutProperty("esri-satellite-layer", "visibility", "none");
+        }
+
+        document.getElementById("satelliteAttribution").style.display = "none";
+        statusEl.innerHTML = "🗺️ Switched to street view";
     }
 }
 
-async function navigateToPlace(lat, lon, name) {
-
-    if (!currentPosition) {
-        alert("Please allow your location first.");
-        return;
-    }
-
-    resultsPanel.style.display =
-        "none";
-
-    if (routePopup) {
-        routePopup.remove();
-        routePopup = null;
-    }
-
-    navigationActive = true;
-    navigationDestination = {
-        lat,
-        lon,
-        name
-    };
-
-    lastHeading = null;
-    deviceHeading = null;
-    lastGoodLat = currentPosition.latitude;
-    lastGoodLon = currentPosition.longitude;
-
-    await drawRouteToDestination(
-        lat,
-        lon,
-        name,
-        false
-    );
+function addSatelliteLayer() {
+    // Layer is added on demand in setMapMode
 }
-
-function stopNavigation() {
-    navigationActive = false;
-    navigationDestination = null;
-    navigationRoute = null;
-    lastHeading = null;
-    deviceHeading = null;
-    document.getElementById("navArrow").style.display =
-        "none";
-    updateNavigationInfo(0, 0);
-    clearRoute();
-}
-
-function clearRoute() {
-
-    if (map.getLayer("route-line")) {
-        map.removeLayer("route-line");
-    }
-
-    if (map.getSource("route-source")) {
-        map.removeSource("route-source");
-    }
-
-    if (routePopup) {
-        routePopup.remove();
-        routePopup = null;
-    }
-
-    navigationActive = false;
-    navigationDestination = null;
-    navigationRoute = null;
-    document.getElementById("navArrow").style.display =
-        "none";
-    updateNavigationInfo(0, 0);
-}
-
-window.navigateToPlace =
-    navigateToPlace;
-
-window.stopNavigation =
-    stopNavigation;
 
 async function fetchOverpass(query) {
-
-    let lastError = null;
+    let lastError;
 
     for (const server of OVERPASS_SERVERS) {
+        try {
+            const response = await fetch(server, {
+                method: "POST",
+                body: query,
+                signal: AbortSignal.timeout(8000) // Reduced from 25s to 8s
+            });
 
-        for (let attempt = 1; attempt <= 2; attempt++) {
-
-            let controller = null;
-            let timeoutId = null;
-
-            try {
-
-                controller = new AbortController();
-
-                timeoutId = setTimeout(
-                    () => controller.abort(),
-                    35000
-                );
-
-                /*
-                 * POST is preferred for Overpass queries. It avoids
-                 * very long URLs and matches the official API examples.
-                 */
-                const response = await fetch(
-                    server,
-                    {
-                        method: "POST",
-                        headers: {
-                            "Content-Type":
-                                "application/x-www-form-urlencoded;charset=UTF-8",
-                            "Accept": "application/json"
-                        },
-                        body:
-                            "data=" +
-                            encodeURIComponent(query),
-                        signal:
-                            controller.signal,
-                        cache: "no-store"
-                    }
-                );
-
-                if (timeoutId) {
-                    clearTimeout(timeoutId);
-                }
-
-                if (!response.ok) {
-                    const text = await response.text();
-
-                    throw new Error(
-                        `${server} returned HTTP ${response.status}` +
-                        (text ? `: ${text.slice(0, 180)}` : "")
-                    );
-                }
-
-                const data =
-                    await response.json();
-
-                return data;
-
-            } catch (error) {
-
-                if (timeoutId) {
-                    clearTimeout(timeoutId);
-                }
-
-                lastError = error;
-
-                console.warn(
-                    `Overpass attempt ${attempt} failed for ${server}:`,
-                    error
-                );
-
-                /*
-                 * Small backoff before retrying the same server.
-                 */
-                if (attempt < 2) {
-                    await new Promise(
-                        resolve => setTimeout(resolve, 1200)
-                    );
-                }
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
             }
+
+            return await response.json();
+        } catch (error) {
+            lastError = error;
+            console.warn("Overpass server failed:", server, error);
         }
     }
 
-    throw lastError ||
-        new Error(
-            "All free Overpass servers failed."
-        );
+    throw lastError || new Error("All Overpass servers failed.");
 }
 
 function buildOverpassQuery(type, radius) {
-
-    const lat =
-        currentPosition.latitude;
-
-    const lon =
-        currentPosition.longitude;
-
+    const lat = currentPosition.latitude;
+    const lon = currentPosition.longitude;
     let filter;
 
     if (type === "atm") {
-
-        filter =
-            `nwr["amenity"="atm"]` +
-            `(around:${radius},${lat},${lon});`;
-
+        filter = `nwr["amenity"="atm"](around:${radius},${lat},${lon});`;
     } else if (type === "bank") {
-
-        filter =
-            `nwr["amenity"="bank"]` +
-            `(around:${radius},${lat},${lon});`;
-
+        filter = `nwr["amenity"="bank"](around:${radius},${lat},${lon});`;
     } else {
-
-        filter =
-            `nwr["shop"]` +
-            `(around:${radius},${lat},${lon});`;
+        filter = `nwr["shop"](around:${radius},${lat},${lon});`;
     }
 
     return `
-        [out:json][timeout:20];
-        (
-            ${filter}
-        );
+        [out:json][timeout:8];
+        (${filter});
         out center tags;
     `;
 }
 
 function getElementCoordinates(element) {
-
     if (element.type === "node") {
-        return {
-            lat: element.lat,
-            lon: element.lon
-        };
+        return { lat: element.lat, lon: element.lon };
     }
-
     if (element.center) {
-        return {
-            lat: element.center.lat,
-            lon: element.center.lon
-        };
+        return { lat: element.center.lat, lon: element.center.lon };
     }
-
     return null;
 }
 
 async function findNearby(type) {
-
     if (!currentPosition) {
-
-        alert(
-            "Please wait until GPS location is available."
-        );
-
+        alert("Please wait until GPS location is available.");
         return;
     }
 
-    document
-        .querySelectorAll(".action-btn")
-        .forEach(
-            btn => btn.classList.remove("active")
-        );
+    document.querySelectorAll(".action-btn").forEach(btn => 
+        btn.classList.remove("active")
+    );
 
-    const selectedButton =
-        document.querySelector(
-            `[data-type="${type}"]`
-        );
-
+    const selectedButton = document.querySelector(`[data-type="${type}"]`);
     if (selectedButton) {
         selectedButton.classList.add("active");
+        selectedButton.disabled = true;
     }
 
-    const radius =
-        Number(radiusSelect.value);
+    const radius = Number(radiusSelect.value);
 
-    statusEl.innerHTML =
-        `🔎 Searching for nearby ${type}s...`;
-
-    resultsPanel.style.display =
-        "block";
-
-    resultsEl.innerHTML =
-        `<div class="place-card">
-            Searching OpenStreetMap...
-        </div>`;
+    statusEl.innerHTML = `<span id="loadingSpinner"></span>Searching for ${type}s...`;
+    resultsPanel.style.display = "block";
+    resultsEl.innerHTML = `<div class="place-card">🔍 Searching OpenStreetMap...</div>`;
 
     clearPlaceMarkers();
 
     try {
-
-        const query =
-            buildOverpassQuery(
-                type,
-                radius
-            );
-
-        const data =
-            await fetchOverpass(query);
+        const query = buildOverpassQuery(type, radius);
+        const data = await fetchOverpass(query);
 
         const places = [];
 
-        for (
-            const element of
-            data.elements || []
-        ) {
-
-            const coords =
-                getElementCoordinates(
-                    element
-                );
-
+        for (const element of data.elements || []) {
+            const coords = getElementCoordinates(element);
             if (!coords) continue;
 
-            const distance =
-                distanceMeters(
-                    currentPosition.latitude,
-                    currentPosition.longitude,
-                    coords.lat,
-                    coords.lon
-                );
+            const distance = distanceMeters(
+                currentPosition.latitude,
+                currentPosition.longitude,
+                coords.lat,
+                coords.lon
+            );
 
-            const tags =
-                element.tags || {};
+            const tags = element.tags || {};
+            let name = tags.name || tags.brand || tags.operator || "";
 
-            let name =
-                tags.name ||
-                tags.brand ||
-                tags.operator ||
-                "";
-
-            if (
-                !name &&
-                type === "shop"
-            ) {
-                name =
-                    tags.shop
-                        ? tags.shop
-                            .replaceAll(
-                                "_",
-                                " "
-                            )
-                        : "Shop";
+            if (!name && type === "shop") {
+                name = tags.shop 
+                    ? tags.shop.replaceAll("_", " ") 
+                    : "Shop";
             }
 
             places.push({
                 id: element.id,
                 lat: coords.lat,
                 lon: coords.lon,
-                name:
-                    name ||
-                    (
-                        type === "atm"
-                            ? "ATM"
-                            : type === "bank"
-                                ? "Bank"
-                                : "Shop"
-                    ),
+                name: name || (type === "atm" ? "ATM" : type === "bank" ? "Bank" : "Shop"),
                 distance,
-                distanceText:
-                    formatDistance(
-                        distance
-                    ),
+                distanceText: formatDistance(distance),
                 tags
             });
         }
 
-        places.sort(
-            (a, b) =>
-                a.distance - b.distance
-        );
-
-        const visiblePlaces =
-            places.slice(0, 30);
+        places.sort((a, b) => a.distance - b.distance);
+        const visiblePlaces = places.slice(0, 30);
 
         if (!visiblePlaces.length) {
-
-            resultsEl.innerHTML =
-                `<div class="place-card">
-                    ❌ No ${type}s found within
-                    ${radius / 1000} km.
-                </div>`;
-
-            statusEl.innerHTML =
-                `❌ No nearby ${type}s found.`;
-
+            resultsEl.innerHTML = `<div class="place-card">❌ No ${type}s found within ${radius / 1000} km.</div>`;
+            statusEl.innerHTML = `❌ No nearby ${type}s found.`;
+            if (selectedButton) selectedButton.disabled = false;
             return;
         }
 
-        visiblePlaces.forEach(
-            place =>
-                createPlaceMarker(
-                    place,
-                    type
-                )
-        );
+        visiblePlaces.forEach(place => createPlaceMarker(place, type));
 
-        resultsEl.innerHTML =
-            visiblePlaces
-                .map(
-                    (place, index) => {
+        resultsEl.innerHTML = visiblePlaces.map((place, index) => {
+            const address = place.tags["addr:street"] || "";
+            return `
+                <div class="place-card">
+                    <div class="place-name">${index + 1}. ${escapeHtml(place.name)}</div>
+                    <div class="place-meta">
+                        📏 ${place.distanceText} away
+                        ${address ? `<br>📍 ${escapeHtml(address)}` : ""}
+                    </div>
+                    <button class="navigate-btn" onclick="navigateToPlace(${place.lat}, ${place.lon}, '${escapeHtml(place.name).replaceAll("'", "\\'")}')">
+                        🧭 Navigate
+                    </button>
+                </div>
+            `;
+        }).join("");
 
-                        const address =
-                            place.tags[
-                                "addr:street"
-                            ]
-                                ? place.tags[
-                                    "addr:street"
-                                ]
-                                : "";
-
-                        return `
-                            <div class="place-card">
-
-                                <div class="place-name">
-                                    ${index + 1}.
-                                    ${escapeHtml(
-                                        place.name
-                                    )}
-                                </div>
-
-                                <div class="place-meta">
-                                    📏
-                                    ${place.distanceText}
-                                    away
-                                    ${
-                                        address
-                                            ? `<br>📍 ${escapeHtml(address)}`
-                                            : ""
-                                    }
-                                </div>
-
-                                <button
-                                    class="navigate-btn"
-                                    onclick="
-                                        navigateToPlace(
-                                            ${place.lat},
-                                            ${place.lon},
-                                            '${escapeHtml(
-                                                place.name
-                                            ).replaceAll(
-                                                "'",
-                                                "\\'"
-                                            )}'
-                                        )
-                                    ">
-                                    🧭 Navigate
-                                </button>
-
-                            </div>
-                        `;
-                    }
-                )
-                .join("");
-
-        statusEl.innerHTML =
-            `✅ Found <b>${visiblePlaces.length}</b>
-             nearby ${type}(s).`;
+        statusEl.innerHTML = `✅ Found <b>${visiblePlaces.length}</b> nearby ${type}(s).`;
 
     } catch (error) {
-
         console.error(error);
-
-        resultsEl.innerHTML =
-            `<div class="place-card">
-                ❌ Nearby places could not be loaded.<br><br>
-                The free OpenStreetMap search service did not respond.
-                Please wait a moment and try again.<br><br>
-                <button
-                    class="navigate-btn"
-                    onclick="findNearby('${type}')">
-                    🔄 Retry
-                </button>
-            </div>`;
-
-        statusEl.innerHTML =
-            "❌ Nearby search service unavailable right now.";
+        resultsEl.innerHTML = `<div class="place-card">❌ Search timeout or error.<br><br>The service may be busy. Try again.</div>`;
+        statusEl.innerHTML = "❌ Nearby search failed.";
+    } finally {
+        if (selectedButton) selectedButton.disabled = false;
     }
 }
 
-document
-    .getElementById("streetBtn")
-    .addEventListener(
-        "click",
-        () => setMapMode(false)
-    );
+function navigateToPlace(lat, lon, name) {
+    if (!currentPosition) return;
 
-document
-    .getElementById("satelliteBtn")
-    .addEventListener(
-        "click",
-        () => setMapMode(true)
-    );
+    statusEl.innerHTML = `🧭 Routing to ${name}...`;
 
-document
-    .getElementById("locateBtn")
-    .addEventListener(
-        "click",
-        () => {
+    const start = `${currentPosition.longitude},${currentPosition.latitude}`;
+    const end = `${lon},${lat}`;
+    const url = `${OSRM_URL}/route/v1/driving/${start};${end}?overview=full&geometries=geojson`;
 
-            if (currentPosition) {
-                map.stop();
+    fetch(url)
+        .then(r => r.json())
+        .then(data => {
+            if (!data.routes || !data.routes[0]) {
+                statusEl.innerHTML = "❌ Route calculation failed.";
+                return;
+            }
 
-                map.flyTo({
-                    center: [
-                        currentPosition.longitude,
-                        currentPosition.latitude
-                    ],
-                    zoom: 18,
-                    speed: 1.1,
-                    curve: 1.2
+            const route = data.routes[0];
+            const distance = (route.distance / 1000).toFixed(1);
+            const duration = Math.round(route.duration / 60);
+
+            if (map.getSource("route")) {
+                map.getSource("route").setData({
+                    type: "Feature",
+                    geometry: route.geometry
                 });
             } else {
-                startHighAccuracyTracking();
+                map.addSource("route", {
+                    type: "geojson",
+                    data: { type: "Feature", geometry: route.geometry }
+                });
+
+                map.addLayer({
+                    id: "route",
+                    type: "line",
+                    source: "route",
+                    layout: { "line-join": "round", "line-cap": "round" },
+                    paint: { "line-color": "#1976d2", "line-width": 4, "line-opacity": 0.8 }
+                });
             }
-        }
-    );
 
-document
-    .querySelectorAll(
-        ".action-btn[data-type]"
-    )
-    .forEach(button => {
+            statusEl.innerHTML = `✅ Route: ${distance} km, ~${duration} min`;
+        })
+        .catch(err => {
+            console.error(err);
+            statusEl.innerHTML = "❌ Route service error.";
+        });
+}
 
-        button.addEventListener(
-            "click",
-            () =>
-                findNearby(
-                    button.dataset.type
-                )
-        );
-    });
+// Event listeners
+document.getElementById("streetBtn").addEventListener("click", () => setMapMode(false));
+document.getElementById("satelliteBtn").addEventListener("click", () => setMapMode(true));
+
+document.getElementById("locateBtn").addEventListener("click", () => {
+    if (currentPosition) {
+        map.flyTo({
+            center: [currentPosition.longitude, currentPosition.latitude],
+            zoom: 18,
+            speed: 1.2
+        });
+    } else {
+        startHighAccuracyTracking();
+    }
+});
+
+document.querySelectorAll(".action-btn[data-type]").forEach(button => {
+    button.addEventListener("click", () => findNearby(button.dataset.type));
+});
 
 map.on("load", function() {
-
-    addSatelliteLayer();
-
-    document
-        .getElementById("streetBtn")
-        .classList.add("active");
-
+    document.getElementById("streetBtn").classList.add("active");
     startHighAccuracyTracking();
 });
 </script>
