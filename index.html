@@ -470,11 +470,14 @@ function handleLocationUpdate(position) {
 
     updateAccuracyUI(accuracy);
 
+    // Only center/zoom on the initial fix. Later GPS updates should
+    // move the marker without unexpectedly changing the user's map zoom.
     if (!userMarker) {
         map.flyTo({
             center: [longitude, latitude],
             zoom: 17,
-            speed: 1.2
+            speed: 1.1,
+            curve: 1.2
         });
     }
 
@@ -808,6 +811,22 @@ function showPlacePopup(place, type) {
         .addTo(map);
 }
 
+function zoomToUser() {
+    if (!currentPosition) return;
+
+    map.stop();
+
+    map.flyTo({
+        center: [
+            currentPosition.longitude,
+            currentPosition.latitude
+        ],
+        zoom: 18,
+        speed: 1.1,
+        curve: 1.2
+    });
+}
+
 function clearRoute() {
 
     if (map.getLayer("route-line")) {
@@ -921,13 +940,31 @@ async function navigateToPlace(lat, lon, name) {
             bounds,
             {
                 padding: {
-                    top: 170,
-                    bottom: 100,
-                    left: 50,
-                    right: 380
-                }
+                    top: 150,
+                    bottom: 90,
+                    left: 40,
+                    right: 300
+                },
+                maxZoom: 18,
+                duration: 700
             }
         );
+
+        // For short routes, fitBounds can still choose a needlessly
+        // wide view because of the side-panel padding. Keep navigation
+        // close to the route.
+        setTimeout(() => {
+            if (map.getZoom() < 15) {
+                map.easeTo({
+                    center: [
+                        lon,
+                        lat
+                    ],
+                    zoom: 17,
+                    duration: 500
+                });
+            }
+        }, 750);
 
         const distance =
             formatDistance(
@@ -1334,18 +1371,18 @@ document
         "click",
         () => {
 
-            if (
-                currentPosition
-            ) {
+            if (currentPosition) {
+                map.stop();
+
                 map.flyTo({
                     center: [
                         currentPosition.longitude,
                         currentPosition.latitude
                     ],
                     zoom: 18,
-                    speed: 1.2
+                    speed: 1.1,
+                    curve: 1.2
                 });
-
             } else {
                 startHighAccuracyTracking();
             }
