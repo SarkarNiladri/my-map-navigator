@@ -293,8 +293,8 @@ html, body {
 
 <script>
 const OVERPASS_SERVERS = [
-    "https://overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter"
+    "https://overpass.private.coffee/api/interpreter",
+    "https://overpass-api.de/api/interpreter"
 ];
 
 const OSRM_URL = "https://router.project-osrm.org";
@@ -1011,58 +1011,92 @@ window.navigateToPlace =
 
 async function fetchOverpass(query) {
 
-    let lastError;
+    let lastError = null;
 
     for (const server of OVERPASS_SERVERS) {
 
-        try {
+        for (let attempt = 1; attempt <= 2; attempt++) {
 
-            const controller =
-                new AbortController();
+            let controller = null;
+            let timeoutId = null;
 
-            const timeout =
-                setTimeout(
+            try {
+
+                controller = new AbortController();
+
+                timeoutId = setTimeout(
                     () => controller.abort(),
-                    30000
+                    35000
                 );
 
-            const url =
-                server +
-                "?data=" +
-                encodeURIComponent(query);
-
-            const response =
-                await fetch(
-                    url,
+                /*
+                 * POST is preferred for Overpass queries. It avoids
+                 * very long URLs and matches the official API examples.
+                 */
+                const response = await fetch(
+                    server,
                     {
+                        method: "POST",
+                        headers: {
+                            "Content-Type":
+                                "application/x-www-form-urlencoded;charset=UTF-8",
+                            "Accept": "application/json"
+                        },
+                        body:
+                            "data=" +
+                            encodeURIComponent(query),
                         signal:
-                            controller.signal
+                            controller.signal,
+                        cache: "no-store"
                     }
                 );
 
-            clearTimeout(timeout);
+                if (timeoutId) {
+                    clearTimeout(timeoutId);
+                }
 
-            if (!response.ok) {
-                throw new Error(
-                    "HTTP " + response.status
+                if (!response.ok) {
+                    const text = await response.text();
+
+                    throw new Error(
+                        `${server} returned HTTP ${response.status}` +
+                        (text ? `: ${text.slice(0, 180)}` : "")
+                    );
+                }
+
+                const data =
+                    await response.json();
+
+                return data;
+
+            } catch (error) {
+
+                if (timeoutId) {
+                    clearTimeout(timeoutId);
+                }
+
+                lastError = error;
+
+                console.warn(
+                    `Overpass attempt ${attempt} failed for ${server}:`,
+                    error
                 );
+
+                /*
+                 * Small backoff before retrying the same server.
+                 */
+                if (attempt < 2) {
+                    await new Promise(
+                        resolve => setTimeout(resolve, 1200)
+                    );
+                }
             }
-
-            return await response.json();
-
-        } catch (error) {
-            lastError = error;
-            console.warn(
-                "Overpass server failed:",
-                server,
-                error
-            );
         }
     }
 
     throw lastError ||
         new Error(
-            "All Overpass servers failed."
+            "All free Overpass servers failed."
         );
 }
 
@@ -1096,7 +1130,7 @@ function buildOverpassQuery(type, radius) {
     }
 
     return `
-        [out:json][timeout:25];
+        [out:json][timeout:20];
         (
             ${filter}
         );
@@ -1341,13 +1375,18 @@ async function findNearby(type) {
 
         resultsEl.innerHTML =
             `<div class="place-card">
-                ❌ Unable to load nearby places.<br><br>
-                The free OpenStreetMap data service may
-                be temporarily busy. Try again.
+                ❌ Nearby places could not be loaded.<br><br>
+                The free OpenStreetMap search service did not respond.
+                Please wait a moment and try again.<br><br>
+                <button
+                    class="navigate-btn"
+                    onclick="findNearby('${type}')">
+                    🔄 Retry
+                </button>
             </div>`;
 
         statusEl.innerHTML =
-            "❌ Nearby search failed.";
+            "❌ Nearby search service unavailable right now.";
     }
 }
 
