@@ -831,6 +831,15 @@ async function navigateToPlace(lat, lon, name) {
         return;
     }
 
+    // Close the nearby-results panel and any map popup immediately
+    // when the user taps Navigate, especially on mobile.
+    resultsPanel.style.display = "none";
+
+    if (routePopup) {
+        routePopup.remove();
+        routePopup = null;
+    }
+
     clearRoute();
 
     statusEl.innerHTML =
@@ -951,6 +960,9 @@ async function navigateToPlace(lat, lon, name) {
     } catch (error) {
 
         console.error(error);
+
+        // Keep the map focused on navigation even when routing fails.
+        resultsPanel.style.display = "none";
 
         statusEl.innerHTML =
             "❌ Could not calculate the route.";
