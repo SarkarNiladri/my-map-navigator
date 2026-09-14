@@ -200,6 +200,57 @@ html, body {
     display: none;
 }
 
+#navArrow {
+    position: absolute;
+    z-index: 25;
+    left: 50%;
+    top: 50%;
+    width: 58px;
+    height: 58px;
+    margin-left: -29px;
+    margin-top: -29px;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    filter: drop-shadow(0 2px 6px rgba(0,0,0,.35));
+}
+
+#navArrow .arrow {
+    width: 0;
+    height: 0;
+    border-left: 15px solid transparent;
+    border-right: 15px solid transparent;
+    border-bottom: 34px solid #1976d2;
+    position: relative;
+    transform-origin: 50% 80%;
+}
+
+#navArrow .arrow::after {
+    content: "";
+    position: absolute;
+    left: -5px;
+    top: 19px;
+    width: 10px;
+    height: 16px;
+    background: #1976d2;
+    border-radius: 2px;
+}
+
+#navigationInfo {
+    position: absolute;
+    top: 125px;
+    left: 12px;
+    z-index: 20;
+    display: none;
+    background: rgba(255,255,255,.96);
+    border-radius: 11px;
+    box-shadow: 0 2px 12px rgba(0,0,0,.24);
+    padding: 10px 13px;
+    min-width: 190px;
+    font-size: 12px;
+}
+
 #satelliteAttribution {
     position: absolute;
     right: 8px;
@@ -272,6 +323,12 @@ html, body {
 
 <div id="map"></div>
 
+<div id="navArrow">
+    <div class="arrow"></div>
+</div>
+
+<div id="navigationInfo"></div>
+
 <div id="accuracyBadge">
     GPS: waiting...
 </div>
@@ -308,6 +365,16 @@ let placeMarkers = [];
 let routePopup = null;
 let isSatellite = false;
 let lastLocationUpdate = 0;
+
+let navigationActive = false;
+let navigationDestination = null;
+let navigationRoute = null;
+let lastRouteUpdateAt = 0;
+let lastHeading = null;
+let lastGoodLat = null;
+let lastGoodLon = null;
+let deviceHeading = null;
+let headingPermissionRequested = false;
 
 const statusEl = document.getElementById("status");
 const accuracyBadge = document.getElementById("accuracyBadge");
@@ -446,6 +513,23 @@ function handleLocationUpdate(position) {
         bestAccuracy = accuracy;
     }
 
+    /*
+     * Reject an occasional large GPS jump when we already have
+     * a much better fix and the new measurement is very inaccurate.
+     */
+    if (
+        currentPosition &&
+        accuracy > 100 &&
+        distanceMeters(
+            currentPosition.latitude,
+            currentPosition.longitude,
+            latitude,
+            longitude
+        ) > Math.max(accuracy * 1.5, 150)
+    ) {
+        return;
+    }
+
     currentPosition = {
         latitude,
         longitude,
@@ -469,6 +553,20 @@ function handleLocationUpdate(position) {
     );
 
     updateAccuracyUI(accuracy);
+
+    if (navigationActive) {
+        updateArrowFromMovement(
+            latitude,
+            longitude
+        );
+
+        if (shouldRecalculateRoute(
+            latitude,
+            longitude
+        )) {
+            recalculateActiveRoute();
+        }
+    }
 
     // Only center/zoom on the initial fix. Later GPS updates should
     // move the marker without unexpectedly changing the user's map zoom.
@@ -502,6 +600,207 @@ function handleLocationUpdate(position) {
              Current accuracy: <b>±${Math.round(accuracy)} m</b><br>
              Best this session: <b>±${Math.round(bestAccuracy)} m</b>`;
     }
+}
+
+function bearingBetween(lat1, lon1, lat2, lon2) {
+    const p1 = lat1 * Math.PI / 180;
+    const p2 = lat2 * Math.PI / 180;
+    const dl = (lon2 - lon1) * Math.PI / 180;
+
+    const y = Math.sin(dl) * Math.cos(p2);
+    const x =
+        Math.cos(p1) * Math.sin(p2) -
+        Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+
+    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+
+function normalizeAngleDelta(delta) {
+    while (delta > 180) delta -= 360;
+    while (delta < -180) delta += 360;
+    return delta;
+}
+
+function smoothHeading(previous, next) {
+    if (previous === null || previous === undefined) return next;
+
+    const delta = normalizeAngleDelta(next - previous);
+    return (previous + delta * 0.25 + 360) % 360;
+}
+
+function setArrowHeading(degrees) {
+    if (!Number.isFinite(degrees)) return;
+
+    lastHeading = smoothHeading(lastHeading, degrees);
+
+    const arrow =
+        document.querySelector("#navArrow .arrow");
+
+    if (arrow) {
+        arrow.style.transform =
+            `rotate(${lastHeading}deg)`;
+    }
+}
+
+function updateNavigationInfo(distanceMetersValue, etaMinutes, headingText = "") {
+    const box = document.getElementById("navigationInfo");
+
+    if (!navigationActive) {
+        box.style.display = "none";
+        return;
+    }
+
+    box.style.display = "block";
+
+    box.innerHTML = `
+        <div><b>🧭 Navigation active</b></div>
+        <div>Remaining: <b>${formatDistance(distanceMetersValue)}</b></div>
+        <div>ETA: <b>${etaMinutes} min</b></div>
+        ${headingText ? `<div>Direction: <b>${headingText}</b></div>` : ""}
+    `;
+}
+
+function startHeadingTracking() {
+    if (headingPermissionRequested) return;
+    headingPermissionRequested = true;
+
+    /*
+     * iOS requires explicit permission for motion/orientation data.
+     * Other browsers generally do not.
+     */
+    if (
+        typeof DeviceOrientationEvent !== "undefined" &&
+        typeof DeviceOrientationEvent.requestPermission === "function"
+    ) {
+        DeviceOrientationEvent.requestPermission()
+            .then(state => {
+                if (state === "granted") {
+                    window.addEventListener(
+                        "deviceorientationabsolute",
+                        handleDeviceOrientation,
+                        true
+                    );
+                }
+            })
+            .catch(() => {});
+    } else if ("DeviceOrientationEvent" in window) {
+        window.addEventListener(
+            "deviceorientationabsolute",
+            handleDeviceOrientation,
+            true
+        );
+        window.addEventListener(
+            "deviceorientation",
+            handleDeviceOrientation,
+            true
+        );
+    }
+}
+
+function handleDeviceOrientation(event) {
+    if (!navigationActive) return;
+
+    let heading = null;
+
+    if (typeof event.webkitCompassHeading === "number") {
+        heading = event.webkitCompassHeading;
+    } else if (typeof event.alpha === "number") {
+        heading = (360 - event.alpha) % 360;
+    }
+
+    if (heading !== null && Number.isFinite(heading)) {
+        deviceHeading = heading;
+        setArrowHeading(heading);
+    }
+}
+
+function getDirectionName(degrees) {
+    const names = [
+        "N", "NE", "E", "SE",
+        "S", "SW", "W", "NW"
+    ];
+    return names[
+        Math.round(degrees / 45) % 8
+    ];
+}
+
+function updateArrowFromMovement(lat, lon) {
+    if (!lastGoodLat || !lastGoodLon) {
+        lastGoodLat = lat;
+        lastGoodLon = lon;
+        return;
+    }
+
+    const moved =
+        distanceMeters(
+            lastGoodLat,
+            lastGoodLon,
+            lat,
+            lon
+        );
+
+    if (moved >= 4) {
+        const movementHeading =
+            bearingBetween(
+                lastGoodLat,
+                lastGoodLon,
+                lat,
+                lon
+            );
+
+        if (deviceHeading === null) {
+            setArrowHeading(movementHeading);
+        }
+
+        lastGoodLat = lat;
+        lastGoodLon = lon;
+    }
+}
+
+function shouldRecalculateRoute(lat, lon) {
+    if (!navigationActive || !navigationDestination) {
+        return false;
+    }
+
+    if (Date.now() - lastRouteUpdateAt < 8000) {
+        return false;
+    }
+
+    if (!navigationRoute?.geometry?.coordinates?.length) {
+        return true;
+    }
+
+    let closest = Infinity;
+
+    for (const coord of navigationRoute.geometry.coordinates) {
+        const d = distanceMeters(
+            lat,
+            lon,
+            coord[1],
+            coord[0]
+        );
+
+        if (d < closest) closest = d;
+    }
+
+    /*
+     * Recalculate if the user is roughly 40 m or more
+     * from the currently displayed route.
+     */
+    return closest > 40;
+}
+
+async function recalculateActiveRoute() {
+    if (!navigationActive || !navigationDestination || !currentPosition) {
+        return;
+    }
+
+    await drawRouteToDestination(
+        navigationDestination.lat,
+        navigationDestination.lon,
+        navigationDestination.name,
+        true
+    );
 }
 
 function updateAccuracyUI(accuracy) {
@@ -843,26 +1142,12 @@ function clearRoute() {
     }
 }
 
-async function navigateToPlace(lat, lon, name) {
+async function drawRouteToDestination(lat, lon, name, isRecalculation = false) {
 
     if (!currentPosition) {
         alert("Please allow your location first.");
         return;
     }
-
-    // Close the nearby-results panel and any map popup immediately
-    // when the user taps Navigate, especially on mobile.
-    resultsPanel.style.display = "none";
-
-    if (routePopup) {
-        routePopup.remove();
-        routePopup = null;
-    }
-
-    clearRoute();
-
-    statusEl.innerHTML =
-        `🧭 Calculating route to <b>${escapeHtml(name)}</b>...`;
 
     const startLon =
         currentPosition.longitude;
@@ -877,8 +1162,15 @@ async function navigateToPlace(lat, lon, name) {
 
     try {
 
+        if (!isRecalculation) {
+            clearRoute();
+        }
+
+        statusEl.innerHTML =
+            `🧭 ${isRecalculation ? "Updating" : "Calculating"} route to <b>${escapeHtml(name)}</b>...`;
+
         const response =
-            await fetch(url);
+            await fetch(url, { cache: "no-store" });
 
         if (!response.ok) {
             throw new Error(
@@ -900,6 +1192,23 @@ async function navigateToPlace(lat, lon, name) {
 
         const route =
             data.routes[0];
+
+        navigationRoute = route;
+        lastRouteUpdateAt = Date.now();
+
+        navigationDestination = {
+            lat,
+            lon,
+            name
+        };
+
+        if (map.getLayer("route-line")) {
+            map.removeLayer("route-line");
+        }
+
+        if (map.getSource("route-source")) {
+            map.removeSource("route-source");
+        }
 
         map.addSource(
             "route-source",
@@ -924,52 +1233,12 @@ async function navigateToPlace(lat, lon, name) {
             paint: {
                 "line-color": "#1976d2",
                 "line-width": 6,
-                "line-opacity": 0.85
+                "line-opacity": 0.88
             }
         });
 
-        const bounds =
-            new maplibregl.LngLatBounds();
-
-        route.geometry.coordinates
-            .forEach(coord => {
-                bounds.extend(coord);
-            });
-
-        map.fitBounds(
-            bounds,
-            {
-                padding: {
-                    top: 150,
-                    bottom: 90,
-                    left: 40,
-                    right: 300
-                },
-                maxZoom: 18,
-                duration: 700
-            }
-        );
-
-        // For short routes, fitBounds can still choose a needlessly
-        // wide view because of the side-panel padding. Keep navigation
-        // close to the route.
-        setTimeout(() => {
-            if (map.getZoom() < 15) {
-                map.easeTo({
-                    center: [
-                        lon,
-                        lat
-                    ],
-                    zoom: 17,
-                    duration: 500
-                });
-            }
-        }, 750);
-
         const distance =
-            formatDistance(
-                route.distance
-            );
+            formatDistance(route.distance);
 
         const minutes =
             Math.max(
@@ -979,35 +1248,131 @@ async function navigateToPlace(lat, lon, name) {
                 )
             );
 
+        /*
+         * Navigation view: keep the current position near the
+         * lower-middle portion of the screen instead of zooming out.
+         */
+        map.easeTo({
+            center: [
+                currentPosition.longitude,
+                currentPosition.latitude
+            ],
+            zoom: 18,
+            duration: 700
+        });
+
+        updateNavigationInfo(
+            route.distance,
+            minutes,
+            lastHeading !== null
+                ? getDirectionName(lastHeading)
+                : ""
+        );
+
         statusEl.innerHTML = `
             🧭 <b>${escapeHtml(name)}</b><br>
             Distance: <b>${distance}</b><br>
-            Estimated driving time: <b>${minutes} min</b>
-            <br>
-            <button
-                class="clear-route-btn"
-                onclick="
-                    clearRoute();
-                    statusEl.innerHTML='📍 Route cleared.';
-                ">
-                Clear Route
-            </button>
+            ETA: <b>${minutes} min</b>
         `;
+
+        document.getElementById("navArrow").style.display =
+            "flex";
+
+        startHeadingTracking();
 
     } catch (error) {
 
         console.error(error);
 
-        // Keep the map focused on navigation even when routing fails.
-        resultsPanel.style.display = "none";
-
         statusEl.innerHTML =
             "❌ Could not calculate the route.";
+
+        if (!isRecalculation) {
+            navigationActive = false;
+            navigationDestination = null;
+            navigationRoute = null;
+            document.getElementById("navArrow").style.display =
+                "none";
+            updateNavigationInfo(0, 0);
+        }
     }
+}
+
+async function navigateToPlace(lat, lon, name) {
+
+    if (!currentPosition) {
+        alert("Please allow your location first.");
+        return;
+    }
+
+    resultsPanel.style.display =
+        "none";
+
+    if (routePopup) {
+        routePopup.remove();
+        routePopup = null;
+    }
+
+    navigationActive = true;
+    navigationDestination = {
+        lat,
+        lon,
+        name
+    };
+
+    lastHeading = null;
+    deviceHeading = null;
+    lastGoodLat = currentPosition.latitude;
+    lastGoodLon = currentPosition.longitude;
+
+    await drawRouteToDestination(
+        lat,
+        lon,
+        name,
+        false
+    );
+}
+
+function stopNavigation() {
+    navigationActive = false;
+    navigationDestination = null;
+    navigationRoute = null;
+    lastHeading = null;
+    deviceHeading = null;
+    document.getElementById("navArrow").style.display =
+        "none";
+    updateNavigationInfo(0, 0);
+    clearRoute();
+}
+
+function clearRoute() {
+
+    if (map.getLayer("route-line")) {
+        map.removeLayer("route-line");
+    }
+
+    if (map.getSource("route-source")) {
+        map.removeSource("route-source");
+    }
+
+    if (routePopup) {
+        routePopup.remove();
+        routePopup = null;
+    }
+
+    navigationActive = false;
+    navigationDestination = null;
+    navigationRoute = null;
+    document.getElementById("navArrow").style.display =
+        "none";
+    updateNavigationInfo(0, 0);
 }
 
 window.navigateToPlace =
     navigateToPlace;
+
+window.stopNavigation =
+    stopNavigation;
 
 async function fetchOverpass(query) {
 
